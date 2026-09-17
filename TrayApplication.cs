@@ -25,7 +25,7 @@ internal sealed class TrayApplication : IDisposable
         DesktopIconToggler.WarmUp();
 
         var menu = new ContextMenuStrip();
-        menu.Items.Add(new ToolStripMenuItem("立即隐藏 / 显示桌面图标", null, (_, _) => DesktopIconToggler.Toggle()));
+        menu.Items.Add(new ToolStripMenuItem("立即隐藏 / 显示桌面图标", null, (_, _) => DesktopIconToggler.ToggleAsync()));
 
         var autoStartItem = new ToolStripMenuItem("开机自启")
         {
@@ -48,18 +48,14 @@ internal sealed class TrayApplication : IDisposable
         {
             if (e.Button == MouseButtons.Left)
             {
-                DesktopIconToggler.Toggle();
+                DesktopIconToggler.ToggleAsync();
             }
         };
 
         _mouseHook = new MouseHook();
+        // 钩子回调中不能做耗时操作，这里只转交参数，实际判断与切换在后台线程完成。
         _mouseHook.MouseDoubleClick += (_, e) =>
-        {
-            if (DesktopIconToggler.ShouldToggleOnDoubleClick(e.ScreenX, e.ScreenY, e.WindowUnderCursor))
-            {
-                DesktopIconToggler.Toggle();
-            }
-        };
+            DesktopIconToggler.HandleDesktopDoubleClick(e.ScreenX, e.ScreenY, e.WindowUnderCursor);
         _mouseHook.Install();
     }
 
@@ -72,6 +68,7 @@ internal sealed class TrayApplication : IDisposable
     public void Dispose()
     {
         _mouseHook.Dispose();
+        DesktopIconToggler.Shutdown();
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
         _icon.Dispose();

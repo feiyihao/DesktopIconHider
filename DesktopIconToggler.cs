@@ -13,6 +13,7 @@ internal static class DesktopIconToggler
 
     private const int LvmHitTest = 0x1000 + 18;     // LVM_HITTEST
     private const int LvmGetItemCount = 0x1000 + 4; // LVM_GETITEMCOUNT
+    private const uint LvmhtOnItem = 0x000E;        // LVMHT_ONITEMICON|ONITEMLABEL|ONITEMSTATEICON
 
     private const uint ProcessVmOperation = 0x0008;
     private const uint ProcessVmRead = 0x0010;
@@ -24,7 +25,15 @@ internal static class DesktopIconToggler
 
     private static IntPtr _cachedDefView;
     private static readonly object Sync = new();
-    private static bool _iconsVisible = true; // 桌面图标当前是否可见
+
+    // 跨进程命中测试复用的进程句柄与远程缓冲区。
+    // 复用可避免每次双击都执行 OpenProcess/VirtualAllocEx（首次调用与长时间闲置后尤其慢）。
+    private static readonly object HitTestSync = new();
+    private static IntPtr _remoteProcess;
+    private static IntPtr _remoteBuffer;
+    private static uint _remotePid;
+
+    private static int _busy; // 防止连续双击时重入
 
     /// <summary>
     /// 启动时在后台线程预先执行窗口查找与命中测试，
@@ -40,11 +49,14 @@ internal static class DesktopIconToggler
                 var listView = defView == IntPtr.Zero ? IntPtr.Zero : FindListView(defView);
                 if (listView != IntPtr.Zero)
                 {
-                    // 同步图标可见状态（隐藏时 ListView 不可见或项目数为 0）。
-                    _iconsVisible = IsWindowVisible(listView) && GetItemCount(listView) > 0;
-                    // 完整执行一次跨进程命中测试，结果无关紧要。
+                    // 完整执行一次命中测试：提前加载模块、建立进程句柄与远程缓冲区缓存。
+                    // 结果无关紧要。
                     ListViewHitTest(listView, new POINT { X = 0, Y = 0 });
                 }
+
+                // 预热双击处理路径（含 Task.Run 与后续代码的 JIT），
+                // 避免首次双击时在钩子回调中产生额外延迟。传入空句柄不会有任何副作用。
+                HandleDesktopDoubleClick(-1, -1, IntPtr.Zero);
             }
             catch
             {
@@ -53,10 +65,18 @@ internal static class DesktopIconToggler
         });
     }
 
-    /// <summary>切换桌面图标的显示 / 隐藏，并同步内部状态。</summary>
+    /// <summary>释放缓存的进程句柄与远程内存。</summary>
+    public static void Shutdown()
+    {
+        lock (HitTestSync)
+        {
+            ResetRemoteBuffer();
+        }
+    }
+
+    /// <summary>切换桌面图标的显示 / 隐藏。</summary>
     public static void Toggle()
     {
-        _iconsVisible = !_iconsVisible;
         var defView = GetDefView();
         if (defView != IntPtr.Zero)
         {
@@ -65,22 +85,67 @@ internal static class DesktopIconToggler
     }
 
     /// <summary>
+    /// 在后台线程切换桌面图标，避免阻塞调用线程（托盘菜单 / 鼠标钩子回调）。
+    /// </summary>
+    public static void ToggleAsync()
+    {
+        if (Interlocked.CompareExchange(ref _busy, 1, 0) != 0)
+        {
+            return; // 上一次切换尚未完成，忽略本次
+        }
+
+        Task.Run(() =>
+        {
+            try
+            {
+                Toggle();
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _busy, 0);
+            }
+        });
+    }
+
+    /// <summary>
+    /// 处理一次桌面双击。
+    /// 所有耗时操作（跨进程命中测试、切换图标）都在后台线程执行，
+    /// 保证全局鼠标钩子回调能立即返回，避免鼠标指针卡顿。
+    /// </summary>
+    public static void HandleDesktopDoubleClick(int screenX, int screenY, IntPtr hWndUnderCursor)
+    {
+        if (Interlocked.CompareExchange(ref _busy, 1, 0) != 0)
+        {
+            return; // 上一次操作尚未完成，忽略本次
+        }
+
+        Task.Run(() =>
+        {
+            try
+            {
+                if (ShouldToggle(screenX, screenY, hWndUnderCursor))
+                {
+                    Toggle();
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _busy, 0);
+            }
+        });
+    }
+
+    /// <summary>
     /// 判断一次双击是否应触发桌面图标切换：
     /// 1. 鼠标必须位于桌面窗口体系内（句柄比对，排除文件资源管理器等其他窗口）；
     /// 2. 图标已隐藏时，任意桌面位置双击都恢复图标；
-    /// 3. 图标可见时，仅空白处（未命中图标）触发。
+    /// 3. 图标可见时，仅空白处（未命中图标、复选框等部位）触发。
     /// </summary>
-    public static bool ShouldToggleOnDoubleClick(int screenX, int screenY, IntPtr hWndUnderCursor)
+    private static bool ShouldToggle(int screenX, int screenY, IntPtr hWndUnderCursor)
     {
         if (!IsDesktopWindow(hWndUnderCursor))
         {
             return false;
-        }
-
-        // 图标已隐藏：双击桌面任意位置恢复图标。
-        if (!_iconsVisible)
-        {
-            return true;
         }
 
         var defView = GetDefView();
@@ -96,6 +161,12 @@ internal static class DesktopIconToggler
             return false;
         }
 
+        // 图标已隐藏（列表视图不可见或没有任何项目）：双击桌面任意位置恢复图标。
+        if (!IsWindowVisible(listView) || GetItemCount(listView) == 0)
+        {
+            return true;
+        }
+
         // 屏幕坐标 → ListView 客户区坐标。
         var pt = new POINT { X = screenX, Y = screenY };
         if (!ScreenToClient(listView, ref pt))
@@ -103,7 +174,7 @@ internal static class DesktopIconToggler
             return false;
         }
 
-        // iItem == -1 表示命中空白区域。
+        // 返回 -1 表示未命中任何图标部位，即空白区域。
         return ListViewHitTest(listView, pt) == -1;
     }
 
@@ -224,64 +295,110 @@ internal static class DesktopIconToggler
         return sb.ToString();
     }
 
+    /// <summary>
+    /// 跨进程执行 ListView 命中测试：返回命中的项目索引，
+    /// -1 表示空白区域，-2 表示无法判定。
+    /// 复用了进程句柄与远程缓冲区，避免每次调用都重新分配（这是卡顿的主要来源之一）。
+    /// </summary>
     private static int ListViewHitTest(IntPtr hListView, POINT clientPt)
     {
-        var info = new LVHITTESTINFO
-        {
-            pt = clientPt,
-            flags = 0,
-            iItem = -1,
-            iSubItem = 0,
-            iGroup = 0
-        };
-
         GetWindowThreadProcessId(hListView, out uint pid);
         if (pid == 0)
         {
             return -2;
         }
 
-        var hProcess = OpenProcess(ProcessVmOperation | ProcessVmRead | ProcessVmWrite, false, pid);
-        if (hProcess == IntPtr.Zero)
-        {
-            return -2;
-        }
-
-        try
+        lock (HitTestSync)
         {
             var size = Marshal.SizeOf<LVHITTESTINFO>();
-            var remote = VirtualAllocEx(hProcess, IntPtr.Zero, (IntPtr)size, MemCommit | MemReserve, PageReadWrite);
-            if (remote == IntPtr.Zero)
+            var info = new LVHITTESTINFO { pt = clientPt };
+
+            if (!WriteHitTestInfo(pid, ref info, size))
+            {
+                // 缓存的句柄可能已失效（如资源管理器重启），重建后重试一次。
+                ResetRemoteBuffer();
+                if (!WriteHitTestInfo(pid, ref info, size))
+                {
+                    return -2;
+                }
+            }
+
+            SendMessage(hListView, LvmHitTest, IntPtr.Zero, _remoteBuffer);
+
+            LVHITTESTINFO result = default;
+            if (!ReadProcessMemory(_remoteProcess, _remoteBuffer, ref result, (IntPtr)size, out _))
             {
                 return -2;
             }
 
-            try
+            // flags 指示命中的部位：命中图标 / 标签 / 复选框等状态图标均视为“非空白”。
+            if ((result.flags & LvmhtOnItem) != 0 || result.iItem >= 0)
             {
-                if (!WriteProcessMemory(hProcess, remote, ref info, (IntPtr)size, out _))
-                {
-                    return -2;
-                }
-
-                SendMessage(hListView, LvmHitTest, IntPtr.Zero, remote);
-
-                LVHITTESTINFO result = default;
-                if (!ReadProcessMemory(hProcess, remote, ref result, (IntPtr)size, out _))
-                {
-                    return -2;
-                }
-
-                return result.iItem;
+                return Math.Max(result.iItem, 0);
             }
-            finally
-            {
-                VirtualFreeEx(hProcess, remote, IntPtr.Zero, MemRelease);
-            }
+
+            return -1;
         }
-        finally
+    }
+
+    private static bool WriteHitTestInfo(uint pid, ref LVHITTESTINFO info, int size)
+    {
+        return EnsureRemoteBuffer(pid)
+            && WriteProcessMemory(_remoteProcess, _remoteBuffer, ref info, (IntPtr)size, out _);
+    }
+
+    /// <summary>确保缓存的进程句柄与远程缓冲区可用于指定进程。</summary>
+    private static bool EnsureRemoteBuffer(uint pid)
+    {
+        if (_remoteProcess != IntPtr.Zero)
         {
-            CloseHandle(hProcess);
+            if (_remotePid == pid)
+            {
+                return true;
+            }
+
+            ResetRemoteBuffer();
         }
+
+        var process = OpenProcess(ProcessVmOperation | ProcessVmRead | ProcessVmWrite, false, pid);
+        if (process == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        var remote = VirtualAllocEx(
+            process,
+            IntPtr.Zero,
+            (IntPtr)Marshal.SizeOf<LVHITTESTINFO>(),
+            MemCommit | MemReserve,
+            PageReadWrite);
+        if (remote == IntPtr.Zero)
+        {
+            CloseHandle(process);
+            return false;
+        }
+
+        _remoteProcess = process;
+        _remotePid = pid;
+        _remoteBuffer = remote;
+        return true;
+    }
+
+    private static void ResetRemoteBuffer()
+    {
+        if (_remoteBuffer != IntPtr.Zero && _remoteProcess != IntPtr.Zero)
+        {
+            VirtualFreeEx(_remoteProcess, _remoteBuffer, IntPtr.Zero, MemRelease);
+        }
+
+        if (_remoteProcess != IntPtr.Zero)
+        {
+            CloseHandle(_remoteProcess);
+        }
+
+        _remoteProcess = IntPtr.Zero;
+        _remoteBuffer = IntPtr.Zero;
+        _remotePid = 0;
     }
 
     [StructLayout(LayoutKind.Sequential)]

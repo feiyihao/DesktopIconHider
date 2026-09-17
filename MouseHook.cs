@@ -5,23 +5,40 @@ using System.Runtime.InteropServices;
 namespace DesktopIconHider;
 
 /// <summary>
-/// 全局低级鼠标钩子，通过两次“鼠标左键抬起”事件的时间与位置间隔来判定双击。
-/// 相比依赖 WM_LBUTTONDBLCLK，此方式在低级钩子中更稳定可靠。
+/// 全局低级鼠标钩子，通过两次“鼠标左键按下”的时间与位置间隔来判定双击。
+/// 相比依赖 WM_LBUTTONDBLCLK，此方式在低级钩子中更稳定可靠；
+/// 同时跟踪拖动（按下后移动超过系统拖动阈值），“拖动 + 单击”不会被误判为双击。
+///
+/// 注意：回调必须尽快返回。低级鼠标钩子会阻塞整个系统的输入处理，
+/// 在回调中做耗时操作（如跨进程调用 / SendMessage）会导致鼠标指针卡住不动，
+/// 因此这里只做轻量判断，耗时操作由订阅方在后台线程处理。
 /// </summary>
 internal sealed class MouseHook : IDisposable
 {
-    private const int WhMouseLl = 14;        // WH_MOUSE_LL
-    private const int WmLButtonUp = 0x0202;  // WM_LBUTTONUP
-    private const int SmCxDoubleClk = 36;    // 双击 X 轴容差
-    private const int SmCyDoubleClk = 37;    // 双击 Y 轴容差
+    private const int WhMouseLl = 14;         // WH_MOUSE_LL
+    private const int WmMouseMove = 0x0200;   // WM_MOUSEMOVE
+    private const int WmLButtonDown = 0x0201; // WM_LBUTTONDOWN
+    private const int WmLButtonUp = 0x0202;   // WM_LBUTTONUP
+    private const int SmCxDoubleClk = 36;     // 双击 X 轴容差
+    private const int SmCyDoubleClk = 37;     // 双击 Y 轴容差
+    private const int SmCxDrag = 68;          // 拖动判定 X 轴阈值
+    private const int SmCyDrag = 69;          // 拖动判定 Y 轴阈值
 
     private readonly LowLevelMouseProc _proc;
     private IntPtr _hookId;
 
-    private long _lastUpTicks;
-    private int _lastUpX;
-    private int _lastUpY;
-    private bool _hasLastUp;
+    // 上一次“干净的单击”（按下到抬起期间未拖动），用于配对判双击
+    private long _lastClickDownTicks;
+    private int _lastClickX;
+    private int _lastClickY;
+    private bool _hasLastClick;
+
+    // 当前按压状态（用于拖动判定）
+    private bool _isButtonDown;
+    private bool _isDragging;
+    private long _pressStartTicks;
+    private int _pressX;
+    private int _pressY;
 
     public event EventHandler<MouseHookEventArgs>? MouseDoubleClick;
 
@@ -49,27 +66,47 @@ internal sealed class MouseHook : IDisposable
 
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode >= 0 && wParam == (IntPtr)WmLButtonUp)
+        // 回调必须轻量、快速返回，否则会阻塞系统输入（鼠标卡顿）。
+        if (nCode >= 0)
         {
             try
             {
                 // MSLLHOOKSTRUCT 前 8 字节为 POINT{X, Y}，直接读取避免装箱/空值警告。
-                var x = Marshal.ReadInt32(lParam, 0);
-                var y = Marshal.ReadInt32(lParam, 4);
-                var now = Stopwatch.GetTimestamp();
+                switch ((int)wParam)
+                {
+                    case WmMouseMove:
+                        if (_isButtonDown && !_isDragging)
+                        {
+                            _isDragging = IsBeyondDrag(
+                                Marshal.ReadInt32(lParam, 0),
+                                Marshal.ReadInt32(lParam, 4));
+                        }
+                        break;
 
-                if (_hasLastUp && IsDoubleClick(now, x, y))
-                {
-                    _hasLastUp = false;
-                    var hWnd = WindowFromPoint(new POINT { X = x, Y = y });
-                    MouseDoubleClick?.Invoke(this, new MouseHookEventArgs(x, y, hWnd));
-                }
-                else
-                {
-                    _hasLastUp = true;
-                    _lastUpTicks = now;
-                    _lastUpX = x;
-                    _lastUpY = y;
+                    case WmLButtonDown:
+                        HandleButtonDown(
+                            Marshal.ReadInt32(lParam, 0),
+                            Marshal.ReadInt32(lParam, 4));
+                        break;
+
+                    case WmLButtonUp:
+                        _isButtonDown = false;
+                        if (_isDragging)
+                        {
+                            // 本次按压是一次拖动（如拖动滑块 / 复选框），不计为单击，
+                            // 因此也不会与紧随其后的单击凑成双击。
+                            _isDragging = false;
+                            _hasLastClick = false;
+                        }
+                        else
+                        {
+                            // 记录这次干净的单击，等待与下一次按下配对。
+                            _hasLastClick = true;
+                            _lastClickDownTicks = _pressStartTicks;
+                            _lastClickX = _pressX;
+                            _lastClickY = _pressY;
+                        }
+                        break;
                 }
             }
             catch
@@ -81,17 +118,44 @@ internal sealed class MouseHook : IDisposable
         return CallNextHookEx(_hookId, nCode, wParam, lParam);
     }
 
-    private bool IsDoubleClick(long nowTicks, int x, int y)
+    private void HandleButtonDown(int x, int y)
     {
-        var elapsedMs = (nowTicks - _lastUpTicks) * 1000.0 / Stopwatch.Frequency;
-        if (elapsedMs > GetDoubleClickTime())
-        {
-            return false;
-        }
+        _isButtonDown = true;
+        _isDragging = false;
+        _pressX = x;
+        _pressY = y;
+        _pressStartTicks = Stopwatch.GetTimestamp();
 
-        var toleranceX = GetSystemMetrics(SmCxDoubleClk);
-        var toleranceY = GetSystemMetrics(SmCyDoubleClk);
-        return Math.Abs(x - _lastUpX) <= toleranceX && Math.Abs(y - _lastUpY) <= toleranceY;
+        // 与上一次“干净的单击”配对：时间间隔按两次按下的时刻计算（同 Windows 系统行为）。
+        var isDoubleClick = _hasLastClick
+            && WithinDoubleClickTime(_pressStartTicks)
+            && WithinDoubleClickRange(x, y);
+
+        _hasLastClick = false;
+
+        if (isDoubleClick)
+        {
+            var hWnd = WindowFromPoint(new POINT { X = x, Y = y });
+            MouseDoubleClick?.Invoke(this, new MouseHookEventArgs(x, y, hWnd));
+        }
+    }
+
+    private bool WithinDoubleClickTime(long nowTicks)
+    {
+        var elapsedMs = (nowTicks - _lastClickDownTicks) * 1000.0 / Stopwatch.Frequency;
+        return elapsedMs <= GetDoubleClickTime();
+    }
+
+    private bool WithinDoubleClickRange(int x, int y)
+    {
+        return Math.Abs(x - _lastClickX) <= GetSystemMetrics(SmCxDoubleClk)
+            && Math.Abs(y - _lastClickY) <= GetSystemMetrics(SmCyDoubleClk);
+    }
+
+    private bool IsBeyondDrag(int x, int y)
+    {
+        return Math.Abs(x - _pressX) > GetSystemMetrics(SmCxDrag)
+            || Math.Abs(y - _pressY) > GetSystemMetrics(SmCyDrag);
     }
 
     public void Dispose()

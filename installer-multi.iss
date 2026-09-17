@@ -2,7 +2,7 @@
 ; 编译: "C:\Users\扉英贺\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer-multi.iss
 
 #define MyAppName "DesktopIconHider"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "DesktopIconHider"
 #define MyAppExeName "DesktopIconHider.exe"
 
